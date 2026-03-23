@@ -198,7 +198,7 @@ def read_arr_from_nifti(nii_path, get_meta_info=False):
     return arr, meta_info
 
 
-def get_roi_from_subject(subject_canonical, meta_info, crop_transform, norm_transform):
+def get_roi_from_subject(subject_canonical: tio.Subject, meta_info, crop_transform: tio.CropOrPad, norm_transform: tio.ZNormalization):
     """
     Applies CropOrPad and ZNormalization to the canonical subject.
     `subject_canonical` is assumed to be after tio.ToCanonical().
@@ -217,7 +217,7 @@ def get_roi_from_subject(subject_canonical, meta_info, crop_transform, norm_tran
     img3D_roi = norm_transform(img3D_roi.squeeze(dim=1)) # (N, C, W, H, D)
     img3D_roi = img3D_roi.unsqueeze(dim=1)
 
-    gt3D_roi = subject_cropped.label.data.clone().detach()
+    gt3D_roi = subject_cropped.label.data.clone().detach() if hasattr(subject_cropped, 'label') else None
 
     # make the roi image/label 5D tensor for torch inference
     def correct_roi_dim(roi_tensor): 
@@ -230,7 +230,7 @@ def get_roi_from_subject(subject_canonical, meta_info, crop_transform, norm_tran
         return roi_tensor
     
     img3D_roi = correct_roi_dim(img3D_roi)
-    gt3D_roi = correct_roi_dim(gt3D_roi)
+    gt3D_roi = correct_roi_dim(gt3D_roi) if gt3D_roi is not None else None
 
     return img3D_roi, gt3D_roi, meta_info
 
@@ -243,7 +243,7 @@ def get_subject_and_meta_info(img_path, gt_path):
     return subject, meta_info
 
 
-def data_preprocess(subject, meta_info, category_index, target_spacing, crop_size=128):
+def data_preprocess(subject, meta_info, category_index, target_spacing, crop_size: int | tuple[int, int, int] = 128):
     # Make the label category-specific IN THE TIO SUBJECT
     # Ensure label data is integer for category comparison
     label_data_for_cat = subject.label.data.clone()
@@ -263,7 +263,8 @@ def data_preprocess(subject, meta_info, category_index, target_spacing, crop_siz
     subject_canonical = transform_canonical(subject_resampled)
 
     # step-3: try to crop or pad roi region (with normalization)
-    crop_transform = tio.CropOrPad(mask_name='label', target_shape=(crop_size, crop_size, crop_size))
+    crop_size = (crop_size, crop_size, crop_size) if isinstance(crop_size, int) else crop_size
+    crop_transform = tio.CropOrPad(mask_name='label', target_shape=crop_size)
     norm_transform = tio.ZNormalization(masking_method=lambda x: x > 0)
     roi_image, roi_label, meta_info = get_roi_from_subject(
         subject_canonical, meta_info, crop_transform, norm_transform
@@ -385,7 +386,7 @@ def validate_paired_img_gt(model, img_path, gt_path, output_path, num_clicks=1, 
     np.random.seed(seed)
 
     os.makedirs(osp.dirname(output_path), exist_ok=True)
-    
+
     exist_categories, final_pred_numpy_original_grid = get_category_list_and_zero_mask(gt_path)
     _, gt_meta_for_saving = read_arr_from_nifti(gt_path, get_meta_info=True)
     subject, meta_info = get_subject_and_meta_info(img_path, gt_path)
