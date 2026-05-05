@@ -188,7 +188,7 @@ def get_next_click3D_torch_ritm(prev_seg, gt_semantic_seg):
     return batch_points, batch_labels  # , (sum(dice_list)/len(dice_list)).item()
 
 
-def get_next_click3D_torch_2(prev_seg, gt_semantic_seg):
+def get_next_click3D_torch_2(prev_seg: torch.Tensor, gt_semantic_seg: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     mask_threshold = 0.5
 

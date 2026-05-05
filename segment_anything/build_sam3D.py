@@ -5,8 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 from functools import partial
+from typing import Callable
 
 import torch
+
+from segment_anything.modeling.sam_model import Sam
 
 from .modeling import ImageEncoderViT3D, MaskDecoder3D, PromptEncoder3D, Sam3D
 
@@ -55,7 +58,7 @@ def build_sam3D_vit_b_ori(checkpoint=None):
     )
 
 
-sam_model_registry3D = {
+sam_model_registry3D: dict[str, Callable[[str | None], Callable[[int, int, int, list[int], str | None], Sam3D]]] = {
     "default": build_sam3D_vit_h,
     "vit_h": build_sam3D_vit_h,
     "vit_l": build_sam3D_vit_l,
@@ -65,12 +68,12 @@ sam_model_registry3D = {
 
 
 def _build_sam3D(
-    encoder_embed_dim,
-    encoder_depth,
-    encoder_num_heads,
-    encoder_global_attn_indexes,
-    checkpoint=None,
-):
+        encoder_embed_dim: int,
+        encoder_depth: int,
+        encoder_num_heads: int,
+        encoder_global_attn_indexes: list[int],
+        checkpoint: str | None=None,
+) -> Sam3D:
     prompt_embed_dim = 384
     image_size = 256
     vit_patch_size = 16

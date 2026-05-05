@@ -1,4 +1,5 @@
 # set up environment
+from typing import cast
 import argparse
 import datetime
 import logging
@@ -13,14 +14,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 import torchio as tio
-from monai.losses import DiceCELoss
+from monai.losses.dice import DiceCELoss
 from torch.backends import cudnn
-from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from segment_anything.build_sam3D import sam_model_registry3D
+from segment_anything.modeling.sam3D import Sam3D
 from utils.click_method import get_next_click3D_torch_2
 from utils.data_loader import Dataset_Union_ALL, Union_Dataloader
 from utils.data_paths import img_datas
@@ -50,6 +51,7 @@ parser.add_argument('--step_size', type=list, default=[120, 180])
 parser.add_argument('--gamma', type=float, default=0.1)
 parser.add_argument('--num_epochs', type=int, default=200)
 parser.add_argument('--img_size', type=int, default=128)
+parser.add_argument('--patch_overlap', type=float, default=0.5)
 parser.add_argument('--batch_size', type=int, default=12)
 parser.add_argument('--accumulation_steps', type=int, default=20)
 parser.add_argument('--lr', type=float, default=8e-4)
@@ -69,14 +71,14 @@ MODEL_SAVE_PATH = join(args.work_dir, args.task_name)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 
-def build_model(args):
-    sam_model = sam_model_registry3D[args.model_type](checkpoint=None).to(device)
+def build_model(args) -> Sam3D | DDP:
+    sam_model = cast(Sam3D, sam_model_registry3D[args.model_type](args.checkpoint)).to(device)
     if args.multi_gpu:
         sam_model = DDP(sam_model, device_ids=[args.rank], output_device=args.rank)
     return sam_model
 
 
-def get_dataloaders(args):
+def get_dataloaders(args) -> Union_Dataloader:
     train_dataset = Dataset_Union_ALL(
         paths=img_datas,
         transform=tio.Compose([
@@ -92,7 +94,7 @@ def get_dataloaders(args):
         train_sampler = DistributedSampler(train_dataset)
         shuffle = False
     else:
-        train_sampler = None
+        patch_overlap = [args.patch_overlap * x for x in args.img_size]
         shuffle = True
 
     # train_dataloader = tio.SubjectsLoader(
@@ -111,7 +113,7 @@ class BaseTrainer:
 
     def __init__(self, model, dataloaders, args):
 
-        self.model = model
+        self.model: DDP | Sam3D = model
         self.dataloaders = dataloaders
         self.args = args
         self.best_loss = np.inf
@@ -121,6 +123,8 @@ class BaseTrainer:
         self.losses = []
         self.dices = []
         self.ious = []
+        self.click_points = []
+        self.click_labels = []
         self.set_loss_fn()
         self.set_optimizer()
         self.set_lr_scheduler()
@@ -145,6 +149,7 @@ class BaseTrainer:
             [
                 {
                     'params': sam_model.image_encoder.parameters()
+                    # TODO: turn off lr for finetune, as we don't want to change the way it interprets images
                 },  # , 'lr': self.args.lr * 0.1},
                 {
                     'params': sam_model.prompt_encoder.parameters(),
@@ -170,7 +175,7 @@ class BaseTrainer:
                                                                 self.args.gamma)
         elif self.args.lr_scheduler == 'coswarm':
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self.optimizer)
+                self.optimizer, 20)
         else:
             self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(self.optimizer, 0.1)
 
@@ -334,7 +339,6 @@ class BaseTrainer:
                 image3D, gt3D = data3D["image"], data3D["label"]
             except Exception as e:
                 print(f"Error processing batch at step {step}: {e}")
-            # import pdb; pdb.set_trace()
             my_context = self.model.no_sync if self.args.rank != - \
                 1 and step % self.args.accumulation_steps != 0 else nullcontext
 
