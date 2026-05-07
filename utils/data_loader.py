@@ -240,6 +240,43 @@ class Union_Dataloader(tio.SubjectsLoader):
         return BackgroundGenerator(super().__iter__())
 
 
+class Union_Dataloader_GridSampler:
+    """Dataloader that uses GridSampler to extract patches with 0.5 coverage from each image/label pair."""
+
+    def __init__(self, dataset, batch_size=1, num_workers=0, **kwargs):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def __iter__(self):
+        for idx in range(len(self.dataset)):
+            # Get image and label
+            sample = self.dataset[idx]
+            image_data = sample["image"]
+            label_data = sample["label"]
+
+            # Create subject from tensors
+            subject = tio.Subject(
+                image=tio.ScalarImage(tensor=image_data),
+                label=tio.LabelMap(tensor=label_data),
+            )
+
+            # Create GridSampler with img_size as patch size
+            # 0.5 coverage means 50% overlap between patches
+            patch_size = self.dataset.image_size
+            overlap = int(patch_size * 0.5)
+
+            grid_sampler = tio.GridSampler(
+                subject,
+                patch_size=patch_size,
+                patch_overlap=overlap,
+            )
+
+            # Yield patches one at a time
+            for patch in grid_sampler:
+                yield patch
+
+
 class Test_Single(Dataset):
 
     def __init__(self, paths, image_size=128, transform=None, threshold=500):
