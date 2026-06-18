@@ -1,4 +1,5 @@
 from argparse import ArgumentParser
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,6 @@ import torchio as tio
 from segment_anything.build_sam3D import sam_model_registry3D
 from utils.infer_utils import (
     data_postprocess,
-    get_roi_from_subject,
     read_arr_from_nifti,
     save_numpy_to_nifti,
 )
@@ -84,6 +84,24 @@ def parse_args():
         default=1,
         help="Foreground label value written in the output mask.",
     )
+    parser.add_argument(
+        "--neighbor-overlap",
+        type=float,
+        default=0.5,
+        help="Fractional overlap between border-triggered neighboring patches.",
+    )
+    parser.add_argument(
+        "--border-width",
+        type=int,
+        default=1,
+        help="Number of voxels at each patch face used to detect border contact.",
+    )
+    parser.add_argument(
+        "--max-patches",
+        type=int,
+        default=64,
+        help="Maximum number of patches to infer. Use 1 for the old single-patch behavior.",
+    )
     return parser.parse_args()
 
 
@@ -131,7 +149,6 @@ def preprocess_image_and_point(
     point_space: str,
     meta_info: dict,
     target_spacing: tuple[float, float, float],
-    crop_size: int,
 ):
     image = tio.ScalarImage(image_path)
     point_index = point_to_torchio_index(image, point, point_space)
@@ -148,22 +165,18 @@ def preprocess_image_and_point(
 
     subject = tio.Resample(target=target_spacing)(subject)
     subject = tio.ToCanonical()(subject)
+    meta_info["canonical_subject_shape"] = subject.spatial_shape
+    meta_info["canonical_subject_affine"] = subject.image.affine.copy()
+    meta_info["roi_subject_affine"] = subject.image.affine.copy()
 
-    crop_shape = (crop_size, crop_size, crop_size)
-    crop_transform = tio.CropOrPad(mask_name="label", target_shape=crop_shape)
-    norm_transform = tio.ZNormalization(masking_method=lambda x: x > 0)
-    roi_image, roi_point_mask, meta_info = get_roi_from_subject(
-        subject, meta_info, crop_transform, norm_transform
-    )
-
-    point_indices = torch.argwhere(roi_point_mask[0, 0] > 0)
+    point_indices = torch.argwhere(subject.label.data[0] > 0)
     if len(point_indices) == 0:
         raise RuntimeError(
             "The prompt point was lost during preprocessing. Try voxel coordinates "
             "or a point farther from the image boundary."
         )
-    roi_point = point_indices.float().mean(dim=0).round().reshape(1, 1, 3)
-    return roi_image, roi_point, meta_info
+    prompt_point = point_indices.float().mean(dim=0).round().to(torch.int64)
+    return subject.image.data.clone().detach(), prompt_point, meta_info
 
 
 def infer_from_point(model, roi_image, roi_point, device: str):
@@ -199,6 +212,166 @@ def infer_from_point(model, roi_image, roi_point, device: str):
     return (torch.sigmoid(masks).cpu().numpy().squeeze() > 0.5).astype(np.uint8)
 
 
+def extract_patch(
+    image_data: torch.Tensor,
+    center: tuple[int, int, int],
+    patch_size: int,
+) -> tuple[
+    torch.Tensor,
+    tuple[int, int, int],
+    tuple[slice, slice, slice],
+    tuple[slice, slice, slice],
+]:
+    spatial_shape = image_data.shape[-3:]
+    starts = tuple(center[axis] - patch_size // 2 for axis in range(3))
+    ends = tuple(start + patch_size for start in starts)
+    src_starts = tuple(max(0, start) for start in starts)
+    src_ends = tuple(min(spatial_shape[axis], ends[axis]) for axis in range(3))
+    dst_starts = tuple(max(0, -start) for start in starts)
+    dst_ends = tuple(
+        dst_starts[axis] + src_ends[axis] - src_starts[axis] for axis in range(3)
+    )
+
+    patch = torch.zeros((1, patch_size, patch_size, patch_size), dtype=image_data.dtype)
+    patch[
+        :,
+        dst_starts[0]:dst_ends[0],
+        dst_starts[1]:dst_ends[1],
+        dst_starts[2]:dst_ends[2],
+    ] = image_data[
+        :,
+        src_starts[0]:src_ends[0],
+        src_starts[1]:src_ends[1],
+        src_starts[2]:src_ends[2],
+    ]
+    source_slices = tuple(slice(src_starts[axis], src_ends[axis]) for axis in range(3))
+    valid_slices = tuple(slice(dst_starts[axis], dst_ends[axis]) for axis in range(3))
+    return patch, starts, source_slices, valid_slices
+
+
+def normalize_patch(patch: torch.Tensor) -> torch.Tensor:
+    norm_transform = tio.ZNormalization(masking_method=lambda x: x > 0)
+    normalized = norm_transform(patch)
+    if torch.isnan(normalized).any():
+        normalized = torch.nan_to_num(normalized)
+    return normalized.unsqueeze(0)
+
+
+def clamp_center(center: tuple[int, int, int], spatial_shape) -> tuple[int, int, int]:
+    return tuple(
+        min(max(0, int(center[axis])), spatial_shape[axis] - 1) for axis in range(3)
+    )
+
+
+def border_triggered_neighbors(
+    patch_pred: np.ndarray,
+    center: tuple[int, int, int],
+    starts: tuple[int, int, int],
+    spatial_shape,
+    patch_size: int,
+    step: int,
+    border_width: int,
+) -> list[tuple[tuple[int, int, int], torch.Tensor]]:
+    neighbors = []
+    for axis in range(3):
+        for direction, border_slice in (
+            (-1, slice(0, border_width)),
+            (1, slice(patch_size - border_width, patch_size)),
+        ):
+            slicer = [slice(None), slice(None), slice(None)]
+            slicer[axis] = border_slice
+            face = patch_pred[tuple(slicer)] > 0
+            if not face.any():
+                continue
+
+            new_center = list(center)
+            new_center[axis] += direction * step
+            new_center = clamp_center(tuple(new_center), spatial_shape)
+            if new_center == center:
+                continue
+
+            face_coords = np.argwhere(face)
+            face_origin = [0, 0, 0]
+            face_origin[axis] = border_slice.start
+            local_seed = np.round(face_coords.mean(axis=0)).astype(int)
+            local_seed[axis] += face_origin[axis]
+            global_seed = torch.tensor(
+                [starts[i] + int(local_seed[i]) for i in range(3)], dtype=torch.int64
+            )
+            neighbors.append((new_center, global_seed))
+    return neighbors
+
+
+def infer_with_border_expansion(
+    model,
+    image_data: torch.Tensor,
+    initial_point: torch.Tensor,
+    crop_size: int,
+    device: str,
+    max_patches: int,
+    neighbor_overlap: float,
+    border_width: int,
+):
+    if not 0 <= neighbor_overlap < 1:
+        raise ValueError("--neighbor-overlap must be >= 0 and < 1.")
+    if max_patches < 1:
+        raise ValueError("--max-patches must be at least 1.")
+    if border_width < 1 or border_width > crop_size:
+        raise ValueError("--border-width must be between 1 and --crop-size.")
+
+    spatial_shape = image_data.shape[-3:]
+    step = max(1, int(round(crop_size * (1.0 - neighbor_overlap))))
+    initial_center = clamp_center(tuple(int(v) for v in initial_point.tolist()), spatial_shape)
+
+    stitched = np.zeros(tuple(spatial_shape), dtype=np.uint8)
+    queue = deque([(initial_center, initial_point.clone().detach())])
+    queued_or_done = {initial_center}
+    inferred = 0
+
+    while queue and inferred < max_patches:
+        center, prompt_global = queue.popleft()
+        patch, starts, source_slices, valid_slices = extract_patch(
+            image_data, center, crop_size
+        )
+        prompt_local = torch.tensor(
+            [[[
+                min(max(0, int(prompt_global[axis]) - starts[axis]), crop_size - 1)
+                for axis in range(3)
+            ]]],
+            dtype=torch.float32,
+        )
+        roi_image = normalize_patch(patch)
+        patch_pred = infer_from_point(model, roi_image, prompt_local, device)
+
+        stitched[source_slices] = np.maximum(
+            stitched[source_slices], patch_pred[valid_slices]
+        )
+        inferred += 1
+
+        for neighbor_center, neighbor_seed in border_triggered_neighbors(
+            patch_pred,
+            center,
+            starts,
+            spatial_shape,
+            crop_size,
+            step,
+            border_width,
+        ):
+            if neighbor_center in queued_or_done or len(queue) + inferred >= max_patches:
+                continue
+            queued_or_done.add(neighbor_center)
+            queue.append((neighbor_center, neighbor_seed))
+
+    if queue:
+        print(
+            f"Warning: stopped after {inferred} patches with {len(queue)} queued; "
+            "increase --max-patches if the object still reaches patch borders."
+        )
+    else:
+        print(f"Inferred {inferred} patch(es).")
+    return stitched
+
+
 def main():
     args = parse_args()
     if not args.image.exists():
@@ -218,16 +391,24 @@ def main():
         args.device,
         strict=not args.allow_partial_weight,
     )
-    roi_image, roi_point, meta_info = preprocess_image_and_point(
+    image_data, prompt_point, meta_info = preprocess_image_and_point(
         args.image,
         args.point,
         args.point_space,
         meta_info,
         tuple(args.target_spacing),
-        args.crop_size,
     )
-    roi_pred = infer_from_point(model, roi_image, roi_point, args.device)
-    pred = data_postprocess(roi_pred, meta_info)
+    canonical_pred = infer_with_border_expansion(
+        model,
+        image_data,
+        prompt_point,
+        args.crop_size,
+        args.device,
+        args.max_patches,
+        args.neighbor_overlap,
+        args.border_width,
+    )
+    pred = data_postprocess(canonical_pred, meta_info)
     pred = (pred > 0).astype(np.uint8) * args.label_value
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
