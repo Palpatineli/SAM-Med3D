@@ -1,6 +1,6 @@
 ''' Example-1: manually list all dataset paths '''
 img_datas = [
-'/mnt/weka/data/nnUNet/sam/stir/nf1/mri_iso/',
+    '/mnt/weka/data/nnUNet/sam/stir/nf1/mri_iso/preprocessed/',
 ]
 ''' Example-2: use glob to automatically list all dataset paths '''
 # import os.path as osp

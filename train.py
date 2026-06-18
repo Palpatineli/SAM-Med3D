@@ -19,6 +19,7 @@ from torch.backends import cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
+import medim
 
 from segment_anything.build_sam3D import sam_model_registry3D
 from segment_anything.modeling.sam3D import Sam3D
@@ -72,7 +73,8 @@ os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 
 def build_model(args) -> Sam3D | DDP:
-    sam_model = cast(Sam3D, sam_model_registry3D[args.model_type](args.checkpoint)).to(device)
+    # sam_model = cast(Sam3D, sam_model_registry3D[args.model_type](args.checkpoint)).to(device)
+    sam_model = medim.create_model("SAM-Med3D", pretrained=True, checkpoint_path=args.checkpoint).to(device)
     if args.multi_gpu:
         sam_model = DDP(sam_model, device_ids=[args.rank], output_device=args.rank)
     return sam_model
@@ -94,7 +96,8 @@ def get_dataloaders(args) -> Union_Dataloader:
         train_sampler = DistributedSampler(train_dataset)
         shuffle = False
     else:
-        patch_overlap = [args.patch_overlap * x for x in args.img_size]
+        # patch_overlap = [args.patch_overlap * x for x in args.img_size.split(',')]
+        train_sampler = None
         shuffle = True
 
     # train_dataloader = tio.SubjectsLoader(
@@ -110,11 +113,10 @@ def get_dataloaders(args) -> Union_Dataloader:
 
 
 class BaseTrainer:
-
-    def __init__(self, model, dataloaders, args):
+    def __init__(self, model: DDP | Sam3D, dataloaders: Union_Dataloader, args):
 
         self.model: DDP | Sam3D = model
-        self.dataloaders = dataloaders
+        self.dataloaders: Union_Dataloader = dataloaders
         self.args = args
         self.best_loss = np.inf
         self.best_dice = 0.0
@@ -137,7 +139,7 @@ class BaseTrainer:
         self.norm_transform = tio.ZNormalization(masking_method=lambda x: x > 0)
 
     def set_loss_fn(self):
-        self.seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+        self.seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean', to_onehot_y=True)
 
     def set_optimizer(self):
         if self.args.multi_gpu:

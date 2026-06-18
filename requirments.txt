@@ -1,0 +1,12 @@
+edt
+torch>=2.6.0
+torchvision>=0.21.0
+torchaudio>=2.6.0
+torchio
+opencv-python-headless
+matplotlib
+prefetch_generator
+monai
+edt
+surface-distance
+medim
