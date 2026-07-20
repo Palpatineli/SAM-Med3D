@@ -236,9 +236,21 @@ def get_roi_from_subject(subject_canonical: tio.Subject, meta_info, crop_transfo
 
 def get_subject_and_meta_info(img_path, gt_path):
     _, meta_info = read_arr_from_nifti(img_path, get_meta_info=True)
+    image = tio.ScalarImage(img_path)
+    label = tio.LabelMap(gt_path)
+
+    if image.shape[1:] == label.shape[1:]:
+        label = tio.LabelMap(tensor=label.data, affine=image.affine)
+    else:
+        label = tio.Resample(
+            target=image,
+            image_interpolation='nearest',
+            label_interpolation='nearest',
+        )(label)
+
     subject = tio.Subject(
-        image=tio.ScalarImage(img_path),
-        label=tio.LabelMap(gt_path) 
+        image=image,
+        label=label
     )
     return subject, meta_info
 
@@ -387,8 +399,12 @@ def validate_paired_img_gt(model, img_path, gt_path, output_path, num_clicks=1, 
 
     os.makedirs(osp.dirname(output_path), exist_ok=True)
 
-    exist_categories, final_pred_numpy_original_grid = get_category_list_and_zero_mask(gt_path)
-    _, gt_meta_for_saving = read_arr_from_nifti(gt_path, get_meta_info=True)
+    exist_categories, _ = get_category_list_and_zero_mask(gt_path)
+    _, image_meta_for_saving = read_arr_from_nifti(img_path, get_meta_info=True)
+    final_pred_numpy_original_grid = np.zeros(
+        image_meta_for_saving["original_numpy_shape"],
+        dtype=np.uint8,
+    )
     subject, meta_info = get_subject_and_meta_info(img_path, gt_path)
 
     for category_index in exist_categories:
@@ -409,5 +425,5 @@ def validate_paired_img_gt(model, img_path, gt_path, output_path, num_clicks=1, 
         cls_pred_original_grid = data_postprocess(roi_pred_numpy, meta_info)
         final_pred_numpy_original_grid[cls_pred_original_grid == 1] = category_index
 
-    # Save the combined prediction which is on the original GT's grid
-    save_numpy_to_nifti(final_pred_numpy_original_grid, output_path, gt_meta_for_saving)
+    # Save the combined prediction on the input image grid.
+    save_numpy_to_nifti(final_pred_numpy_original_grid, output_path, image_meta_for_saving)
